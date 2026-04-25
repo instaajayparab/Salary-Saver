@@ -9,7 +9,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- DATABASE SETUP ---
         let db = null;
@@ -17,10 +17,11 @@
         let user = null;
         let transactions = [];
         let chart = null;
+        let editingId = null; 
+        let pendingDeleteId = null;
         const DAILY_BUDGET = 500;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'salary-saver-pro';
 
-        // Initialize Firebase ONLY if config is available
         try {
             if (typeof __firebase_config !== 'undefined') {
                 const firebaseConfig = JSON.parse(__firebase_config);
@@ -45,12 +46,10 @@
                     }
                 });
             } else {
-                // Fallback for Local Testing (No Firebase)
                 loadLocalData();
                 document.getElementById('user-id-display').innerText = "Offline Mode";
             }
         } catch (e) {
-            console.log("Running in offline fallback mode");
             loadLocalData();
         }
 
@@ -64,6 +63,8 @@
             onSnapshot(q, (snapshot) => {
                 transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 refreshUI();
+            }, (error) => {
+                console.error("Firestore error:", error);
             });
         }
 
@@ -93,41 +94,107 @@
 
             const btn = document.getElementById('save-btn');
             btn.disabled = true;
-            btn.innerText = "Saving...";
+            btn.innerText = editingId ? "Updating..." : "Saving...";
 
-            const newEntry = {
+            let existingDate = new Date().toISOString();
+            if (editingId) {
+                const match = transactions.find(t => (t.id === editingId || t.date === editingId));
+                if (match) existingDate = match.date;
+            }
+
+            const entryData = {
                 type,
                 amount,
                 note: note || (type === 'saved' ? 'Cooked at home' : 'Food Expense'),
-                date: new Date().toISOString()
+                date: existingDate
             };
 
             try {
                 if (db && user) {
-                    // Save to Cloud
-                    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'transactions'), newEntry);
+                    if (editingId) {
+                        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'transactions', editingId);
+                        await updateDoc(docRef, entryData);
+                    } else {
+                        await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'transactions'), entryData);
+                    }
                 } else {
-                    // Save Locally (Fallback)
-                    transactions.unshift(newEntry);
+                    if (editingId) {
+                        const index = transactions.findIndex(t => (t.id === editingId || t.date === editingId));
+                        if (index !== -1) transactions[index] = entryData;
+                    } else {
+                        transactions.unshift(entryData);
+                    }
                     localStorage.setItem('salary_saver_data', JSON.stringify(transactions));
                     refreshUI();
                 }
                 toggleModal();
-                showToast("Entry Added! 🚀");
+                showToast(editingId ? "Entry Updated! ✨" : "Entry Added! 🚀");
             } catch (e) {
                 showToast("Error saving entry");
             } finally {
                 btn.disabled = false;
                 btn.innerText = "Add Entry";
+                editingId = null;
                 document.getElementById('amount-input').value = '';
                 document.getElementById('note-input').value = '';
             }
+        };
+
+        window.confirmDelete = (id) => {
+            pendingDeleteId = id;
+            document.getElementById('delete-modal').classList.remove('hidden');
+        };
+
+        window.closeDeleteModal = () => {
+            pendingDeleteId = null;
+            document.getElementById('delete-modal').classList.add('hidden');
+        };
+
+        window.executeDelete = async () => {
+            if (!pendingDeleteId) return;
+            const id = pendingDeleteId;
+            
+            try {
+                if (db && user) {
+                    const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'transactions', id);
+                    await deleteDoc(docRef);
+                } else {
+                    transactions = transactions.filter(t => (t.id !== id && t.date !== id));
+                    localStorage.setItem('salary_saver_data', JSON.stringify(transactions));
+                    refreshUI();
+                }
+                showToast("Deleted successfully");
+            } catch (e) {
+                showToast("Error deleting entry");
+            } finally {
+                closeDeleteModal();
+            }
+        };
+
+        window.editEntry = (id) => {
+            const entry = transactions.find(t => t.id === id || t.date === id);
+            if (!entry) return;
+
+            editingId = id;
+            document.getElementById('type-input').value = entry.type;
+            document.getElementById('amount-input').value = entry.amount;
+            document.getElementById('note-input').value = entry.note;
+            document.getElementById('modal-title').innerText = "Modify Entry";
+            document.getElementById('save-btn').innerText = "Update Entry";
+            toggleModal();
         };
 
         // --- UI HELPERS ---
         window.toggleModal = () => {
             const modal = document.getElementById('add-modal');
             modal.classList.toggle('hidden');
+            if (modal.classList.contains('hidden')) {
+                editingId = null;
+                document.getElementById('modal-title').innerText = "Add New Entry";
+                document.getElementById('save-btn').innerText = "Add Entry";
+                document.getElementById('amount-input').value = '';
+                document.getElementById('note-input').value = '';
+            }
         };
 
         window.switchTab = (tab) => {
@@ -143,24 +210,33 @@
             const list = document.getElementById('transaction-list');
             list.innerHTML = '';
             if (transactions.length === 0) {
-                list.innerHTML = `<div class="text-center py-10 opacity-50 text-sm">No activity yet. Tap + to start!</div>`;
+                list.innerHTML = `<div class="text-center py-10 opacity-50 text-sm font-bold">No activity yet</div>`;
                 return;
             }
-            transactions.slice(0, 10).forEach(tx => {
+            transactions.forEach(tx => {
+                const id = tx.id || tx.date; 
                 const isExpense = tx.type === 'expense';
                 const div = document.createElement('div');
-                div.className = 'android-card p-4 flex justify-between items-center mb-3 shadow-sm border border-slate-50';
+                div.className = 'android-card p-4 mb-3 border border-slate-100';
                 div.innerHTML = `
-                    <div class="flex items-center gap-3">
-                        <div class="w-10 h-10 rounded-xl ${isExpense ? 'bg-red-50 text-red-500' : 'bg-emerald-50 text-emerald-500'} flex items-center justify-center text-xl">
-                            ${isExpense ? '🍔' : '💰'}
+                    <div class="flex justify-between items-center">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-xl ${isExpense ? 'bg-red-50 text-red-500' : 'bg-emerald-50 text-emerald-500'} flex items-center justify-center text-xl">
+                                ${isExpense ? '🍔' : '💰'}
+                            </div>
+                            <div>
+                                <p class="font-bold text-sm text-slate-800">${tx.note}</p>
+                                <p class="text-[10px] text-slate-400 font-bold">${new Date(tx.date).toLocaleDateString('en-IN')}</p>
+                            </div>
                         </div>
-                        <div>
-                            <p class="font-bold text-sm">${tx.note}</p>
-                            <p class="text-[10px] text-slate-400 font-bold">${new Date(tx.date).toLocaleDateString('en-IN')}</p>
+                        <div class="text-right">
+                            <p class="font-bold ${isExpense ? 'text-red-500' : 'text-emerald-600'}">₹${tx.amount}</p>
+                            <div class="flex gap-3 mt-1 justify-end">
+                                <button onclick="editEntry('${id}')" class="text-[10px] font-extrabold text-blue-600 uppercase">Edit</button>
+                                <button onclick="confirmDelete('${id}')" class="text-[10px] font-extrabold text-red-500 uppercase">Delete</button>
+                            </div>
                         </div>
                     </div>
-                    <span class="font-bold ${isExpense ? 'text-red-500' : 'text-emerald-600'}">₹${tx.amount}</span>
                 `;
                 list.appendChild(div);
             });
@@ -182,19 +258,22 @@
         }
 
         function updateChart() {
-            const ctx = document.getElementById('spendingChart').getContext('2d');
+            const canvas = document.getElementById('spendingChart');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
             const labels = ['6d', '5d', '4d', '3d', '2d', '1d', 'Today'];
             const spent = [0, 0, 0, 0, 0, 0, 0];
             const saved = [0, 0, 0, 0, 0, 0, 0];
 
-            // Simple logic to fill chart data from transactions
             transactions.forEach(tx => {
                 const txDate = new Date(tx.date);
                 const diff = Math.floor((new Date() - txDate) / (1000 * 60 * 60 * 24));
                 if (diff < 7) {
                     const index = 6 - diff;
-                    if (tx.type === 'expense') spent[index] += tx.amount;
-                    else saved[index] += tx.amount;
+                    if (index >= 0) {
+                        if (tx.type === 'expense') spent[index] += tx.amount;
+                        else saved[index] += tx.amount;
+                    }
                 }
             });
 
@@ -208,27 +287,32 @@
                         { label: 'Saved', data: saved, backgroundColor: '#34d399', borderRadius: 4 }
                     ]
                 },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { display: false }, x: { grid: { display: false } } } }
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    plugins: { legend: { display: false } }, 
+                    scales: { y: { display: false }, x: { grid: { display: false } } } 
+                }
             });
         }
 
         function showToast(msg) {
             const t = document.createElement('div');
-            t.className = "fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full text-xs font-bold z-[200]";
+            t.className = "fixed bottom-24 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full text-xs font-bold z-[300] shadow-xl animate-bounce";
             t.innerText = msg;
             document.body.appendChild(t);
-            setTimeout(() => t.remove(), 2000);
+            setTimeout(() => t.remove(), 2500);
         }
     </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
-        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #f8fafc; color: #1e293b; user-select: none; }
-        .android-card { background: white; border-radius: 24px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05); }
-        .fab { position: fixed; bottom: 100px; right: 24px; width: 60px; height: 60px; border-radius: 18px; background: #2563eb; color: white; display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 20px rgba(37, 99, 235, 0.3); z-index: 50; cursor: pointer; }
-        .nav-item { display: flex; flex-direction: column; align-items: center; font-size: 0.65rem; color: #94a3b8; font-weight: 800; cursor: pointer; }
-        .nav-item.active { color: #2563eb; }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #f8fafc; color: #1e293b; user-select: none; -webkit-tap-highlight-color: transparent; }
+        .android-card { background: white; border-radius: 20px; box-shadow: 0 4px 12px -2px rgb(0 0 0 / 0.05); }
+        .fab { position: fixed; bottom: 100px; right: 24px; width: 64px; height: 64px; border-radius: 20px; background: #2563eb; color: white; display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 25px rgba(37, 99, 235, 0.4); z-index: 50; cursor: pointer; }
+        .nav-item { display: flex; flex-direction: column; align-items: center; font-size: 0.65rem; color: #94a3b8; font-weight: 800; cursor: pointer; transition: 0.2s; }
+        .nav-item.active { color: #2563eb; transform: scale(1.1); }
         @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-        .animate-slide-up { animation: slideUp 0.3s ease-out; }
+        .animate-slide-up { animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
     </style>
 </head>
 <body class="max-w-md mx-auto min-h-screen pb-32 px-4">
@@ -236,96 +320,116 @@
     <header class="py-6 flex justify-between items-center">
         <div>
             <h1 class="text-xl font-extrabold tracking-tight">SalarySaver</h1>
-            <p id="user-id-display" class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">ID: USER_772</p>
+            <p id="user-id-display" class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">ID: Syncing...</p>
         </div>
-        <div class="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600 border border-blue-100">💰</div>
+        <div class="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600 border border-blue-100">🥗</div>
     </header>
 
     <main id="dashboard-view" class="space-y-6">
-        <div class="android-card p-6 bg-gradient-to-br from-blue-600 to-indigo-700 text-white">
-            <div class="flex justify-between items-center mb-4">
-                <span class="text-xs font-bold uppercase opacity-80">Daily Food Budget</span>
-                <span id="daily-remaining" class="text-xl font-extrabold tracking-tighter">₹500 Left</span>
+        <div class="android-card p-6 bg-gradient-to-br from-blue-600 to-indigo-700 text-white relative overflow-hidden">
+            <div class="relative z-10">
+                <div class="flex justify-between items-center mb-4">
+                    <span class="text-xs font-bold uppercase opacity-80">Today's Allowance</span>
+                    <span id="daily-remaining" class="text-xl font-extrabold tracking-tighter">₹500 Left</span>
+                </div>
+                <div class="w-full bg-white/20 rounded-full h-2.5 mb-2">
+                    <div id="budget-progress-bar" class="bg-white h-2.5 rounded-full transition-all duration-700" style="width: 0%"></div>
+                </div>
+                <p class="text-[10px] opacity-70 font-bold uppercase">Budget: ₹500/day</p>
             </div>
-            <div class="w-full bg-white/20 rounded-full h-2 mb-2">
-                <div id="budget-progress-bar" class="bg-white h-2 rounded-full transition-all" style="width: 0%"></div>
-            </div>
-            <p class="text-[10px] opacity-70">Limit: ₹500/day. Try to keep the bar low!</p>
+            <div class="absolute -right-4 -bottom-4 opacity-10 text-8xl">🍔</div>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
-            <div class="android-card p-4 border-b-4 border-emerald-400">
+            <div class="android-card p-4 border-b-4 border-emerald-500">
                 <span class="text-[10px] text-slate-400 uppercase font-extrabold tracking-widest">Total Saved</span>
                 <p id="total-saved" class="text-lg font-extrabold mt-1 text-emerald-600">₹0</p>
             </div>
-            <div class="android-card p-4 border-b-4 border-blue-400">
+            <div class="android-card p-4 border-b-4 border-blue-500">
                 <span class="text-[10px] text-slate-400 uppercase font-extrabold tracking-widest">Saved Meals</span>
                 <p id="savings-count" class="text-lg font-extrabold mt-1 text-blue-600">0</p>
             </div>
         </div>
 
         <div class="android-card p-5 h-48">
-            <h3 class="text-[10px] font-extrabold text-slate-400 uppercase mb-4 tracking-widest">Last 7 Days</h3>
+            <h3 class="text-[10px] font-extrabold text-slate-400 uppercase mb-4 tracking-widest">Weekly Trends</h3>
             <canvas id="spendingChart"></canvas>
         </div>
 
         <div class="space-y-3">
-            <h3 class="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">History</h3>
+            <h3 class="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                Recent Activity <div class="w-1 h-1 rounded-full bg-slate-300"></div>
+            </h3>
             <div id="transaction-list"></div>
         </div>
     </main>
 
     <main id="advice-view" class="hidden py-4 space-y-4">
-        <h2 class="text-xl font-bold mb-4 px-2">Saving Strategies</h2>
+        <h2 class="text-xl font-bold mb-4 px-2">Pro Saver Tips</h2>
         <div class="android-card p-5 border-l-4 border-blue-500">
-            <h4 class="font-bold text-sm text-blue-600">Drink Water First</h4>
-            <p class="text-xs text-slate-500 mt-1">Often we are thirsty, not hungry. Drink 2 glasses of water before opening Zomato. Usually, the craving goes away.</p>
+            <h4 class="font-bold text-sm text-blue-600">The 10-Minute Rule</h4>
+            <p class="text-xs text-slate-500 mt-1">When you feel like ordering, close the app for 10 minutes. Most cravings are impulsive and fade quickly.</p>
         </div>
         <div class="android-card p-5 border-l-4 border-emerald-500">
-            <h4 class="font-bold text-sm text-emerald-600">Batch Cooking</h4>
-            <p class="text-xs text-slate-500 mt-1">Cook a big batch of Dal/Rice on Sunday. It’s hard to justify ordering out when there's already food in the fridge.</p>
+            <h4 class="font-bold text-sm text-emerald-600">Meal Prep Dal</h4>
+            <p class="text-xs text-slate-500 mt-1">Keeping boiled Dal in the fridge saves 80% of your cooking time. Just temper it and dinner is ready in 5 mins.</p>
         </div>
     </main>
 
-    <div id="add-modal" class="fixed inset-0 bg-slate-900/60 hidden z-[100] flex items-end">
+    <!-- Modal for Adding/Editing -->
+    <div id="add-modal" class="fixed inset-0 bg-slate-900/60 hidden z-[200] flex items-end">
         <div class="bg-white w-full rounded-t-[32px] p-8 animate-slide-up shadow-2xl">
-            <div class="w-12 h-1 bg-slate-100 rounded-full mx-auto mb-8"></div>
+            <div class="w-12 h-1.5 bg-slate-100 rounded-full mx-auto mb-8"></div>
             <div class="space-y-6">
+                <h2 id="modal-title" class="text-lg font-extrabold text-slate-800 tracking-tight">Add New Entry</h2>
                 <div>
                     <label class="block text-[10px] font-extrabold text-slate-400 uppercase mb-2">Category</label>
-                    <select id="type-input" class="w-full p-4 bg-slate-50 border-none rounded-xl font-bold">
+                    <select id="type-input" class="w-full p-4 bg-slate-50 border-none rounded-2xl font-bold appearance-none">
                         <option value="expense">Spent on Food 🍔</option>
                         <option value="saved">Saved (Home Cooked) 💰</option>
                     </select>
                 </div>
                 <div>
                     <label class="block text-[10px] font-extrabold text-slate-400 uppercase mb-2">Amount (₹)</label>
-                    <input id="amount-input" type="number" placeholder="0" class="w-full p-4 bg-slate-50 border-none rounded-xl font-bold text-lg">
+                    <input id="amount-input" type="number" inputmode="numeric" placeholder="0" class="w-full p-4 bg-slate-50 border-none rounded-2xl font-bold text-lg focus:ring-2 focus:ring-blue-100">
                 </div>
                 <div>
                     <label class="block text-[10px] font-extrabold text-slate-400 uppercase mb-2">Notes</label>
-                    <input id="note-input" type="text" placeholder="Lunch / Dinner" class="w-full p-4 bg-slate-50 border-none rounded-xl font-bold">
+                    <input id="note-input" type="text" placeholder="Lunch / Dinner" class="w-full p-4 bg-slate-50 border-none rounded-2xl font-bold focus:ring-2 focus:ring-blue-100">
                 </div>
-                <div class="flex gap-4 pt-4">
+                <div class="flex gap-4 pt-4 pb-4">
                     <button onclick="toggleModal()" class="flex-1 py-4 font-bold text-slate-400">Cancel</button>
-                    <button id="save-btn" onclick="saveTransaction()" class="flex-[2] bg-blue-600 text-white font-bold py-4 rounded-xl shadow-lg">Add Entry</button>
+                    <button id="save-btn" onclick="saveTransaction()" class="flex-[2] bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-lg active:scale-95 transition-transform">Add Entry</button>
                 </div>
             </div>
         </div>
     </div>
 
-    <div class="fab" onclick="toggleModal()">
-        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" stroke="currentColor" stroke-width="4" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+    <!-- Custom Confirmation Modal -->
+    <div id="delete-modal" class="fixed inset-0 bg-slate-900/60 hidden z-[250] flex items-center justify-center p-6">
+        <div class="bg-white w-full max-w-xs rounded-[24px] p-6 text-center space-y-4">
+            <div class="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center text-3xl mx-auto">🗑️</div>
+            <h3 class="font-extrabold text-lg text-slate-800">Delete this entry?</h3>
+            <p class="text-xs text-slate-500 font-medium leading-relaxed">This action cannot be undone. Your history and stats will be updated.</p>
+            <div class="flex gap-3 pt-2">
+                <button onclick="closeDeleteModal()" class="flex-1 py-3 font-bold text-slate-400 text-sm">Cancel</button>
+                <button onclick="executeDelete()" class="flex-1 bg-red-500 text-white font-bold py-3 rounded-xl text-sm shadow-md">Delete</button>
+            </div>
+        </div>
     </div>
 
-    <nav class="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-md border-t border-slate-100 flex justify-around py-5 z-40 max-w-md mx-auto rounded-t-[30px] shadow-2xl">
+    <div class="fab" onclick="toggleModal()">
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="none" stroke="currentColor" stroke-width="3.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+    </div>
+
+    <nav class="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-lg border-t border-slate-100 flex justify-around py-5 z-40 max-w-md mx-auto rounded-t-[32px] shadow-[0_-10px_40px_-15px_rgba(0,0,0,0.1)]">
         <div id="nav-home" class="nav-item active" onclick="switchTab('home')">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
-            <span class="mt-1">HOME</span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+            <span class="mt-1">DASHBOARD</span>
         </div>
         <div id="nav-advice" class="nav-item" onclick="switchTab('advice')">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" stroke="currentColor" stroke-width="3" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4M12 8h.01"></path></svg>
-            <span class="mt-1">ADVICE</span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4M12 8h.01"></path></svg>
+            <span class="mt-1">TIPS</span>
         </div>
     </nav>
 </body>
